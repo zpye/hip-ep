@@ -231,6 +231,8 @@ void populateHipsrAllocOutputLoweringPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns);
 void populateHipsrPreserveShapeLoweringPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns);
+void populateHipsrStreamSyncLoweringPatterns(const LLVMTypeConverter &converter,
+                                             RewritePatternSet &patterns);
 
 } // namespace hipsr
 } // namespace mlir

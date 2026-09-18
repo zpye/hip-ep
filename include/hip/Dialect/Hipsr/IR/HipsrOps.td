@@ -68,6 +68,7 @@ include "hip/Dialect/Hipsr/IR/HipsrScatterNDOp.td"
 include "hip/Dialect/Hipsr/IR/HipsrNonZeroOp.td"
 include "hip/Dialect/Hipsr/IR/HipsrConstantOp.td"
 include "hip/Dialect/Hipsr/IR/HipsrGetPoolOp.td"
+include "hip/Dialect/Hipsr/IR/HipsrStreamSyncOp.td"
 include "hip/Dialect/Hipsr/IR/HipsrPreserveShapeOp.td"
 include "hip/Dialect/Hipsr/IR/HipsrAllocOutputOp.td"
 

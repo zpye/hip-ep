@@ -135,6 +135,40 @@ def PartitionPoolDomainsPass
   ];
 }
 
+def InsertDomainStreamSyncsPass
+    : Pass<"hipsr-insert-domain-stream-syncs", "mlir::func::FuncOp"> {
+  let summary =
+      "Insert a stream wait before each pool domain that reads another domain";
+  let description = [{
+    Inserts `hipsr.stream_sync` in the parent block immediately before each
+    `hipsr.pool_domain` that takes an operand defined by another
+    `hipsr.pool_domain`. The wait uses that consumer's context operand.
+
+    A domain whose operands are only the function context and original graph
+    inputs is left unchanged. A `hipsr.stream_sync` already sitting immediately
+    before the consumer is not duplicated.
+
+    The op stays outside the domain body so later passes that reorder the body
+    cannot move the wait past the host shape loads.
+
+    Before:
+    ```mlir
+    %0 = hipsr.pool_domain(%ctx, %input) { ... }
+    %1 = hipsr.pool_domain(%ctx, %0) { ... }
+    ```
+
+    After:
+    ```mlir
+    %0 = hipsr.pool_domain(%ctx, %input) { ... }
+    hipsr.stream_sync(%ctx)
+    %1 = hipsr.pool_domain(%ctx, %0) { ... }
+    ```
+  }];
+  let dependentDialects = [
+    "::mlir::hipsr::HipsrDialect"
+  ];
+}
+
 def MaterializeInitTensorsPass
     : Pass<"hipsr-materialize-init-tensors", "mlir::ModuleOp"> {
   let summary = "Materialize hipsr.placeholder inits into tensor.empty";
@@ -152,7 +186,7 @@ def MaterializeInitTensorsPass
     Every `scf.execute_region` precedes every `tensor.empty`, which precedes
     every data op, so `hipsr-pool-alloc` sees all buffer sizes at domain entry.
 
-    Runs after `hipsr-partition-pool-domains` and requires shape regions
+    Runs after `hipsr-insert-domain-stream-syncs` and requires shape regions
     already filled by `hipsr-populate-shape-region`. `hipsr.placeholder` has no
     bufferization interface, so this pass must run before bufferization.
   }];

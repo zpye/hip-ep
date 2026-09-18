@@ -28,6 +28,7 @@ add_library(HipsrDialectIR STATIC
   HipsrScatterNDOp.cpp
   HipsrNonZeroOp.cpp
   HipsrGetPoolOp.cpp
+  HipsrStreamSyncOp.cpp
   HipsrPreserveShapeOp.cpp
   HipsrLLVMLoweringUtils.cpp
   HipsrTypes.cpp

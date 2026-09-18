@@ -29,6 +29,7 @@
 //   --convert-onnx-to-hipsr
 //   --hipsr-populate-shape-region
 //   --hipsr-partition-pool-domains
+//   --hipsr-insert-domain-stream-syncs
 //   --hipsr-materialize-init-tensors
 //   --remove-shape-constraints
 //   --hipsr-convert-shape-to-extent
@@ -58,6 +59,7 @@ void mlir::hipsr::buildHipsrPipeline(OpPassManager &pm,
   pm.addPass(createConvertOnnxToHipsrPass());
   pm.addNestedPass<func::FuncOp>(createPopulateShapeRegionPass());
   pm.addNestedPass<func::FuncOp>(createPartitionPoolDomainsPass());
+  pm.addNestedPass<func::FuncOp>(createInsertDomainStreamSyncsPass());
   pm.addPass(createMaterializeInitTensorsPass());
   pm.addNestedPass<func::FuncOp>(createRemoveShapeConstraintsPass());
   pm.addNestedPass<func::FuncOp>(createConvertShapeToExtentPass());
