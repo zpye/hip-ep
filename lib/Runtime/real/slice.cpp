@@ -62,6 +62,181 @@ static int slice_hipdnn_to_hip_dtype(int64_t hipdnn_type) {
   }
 }
 
+// Window tensors are already on the host. `axes_host` / `steps_host` may be
+// nullptr, which means ONNX's defaults: axes [0, ..., K-1] and unit steps.
+static int slice_from_host_windows(
+    RuntimeState *state, void *data, void *output, const int64_t *data_shape,
+    int64_t data_rank, const int64_t *output_shape,
+    const int64_t *starts_host, const int64_t *ends_host,
+    const int64_t *axes_host, const int64_t *steps_host, int64_t K,
+    int64_t data_type) {
+  int hip_dtype = slice_hipdnn_to_hip_dtype(data_type);
+  if (hip_dtype < 0) {
+    fprintf(stderr,
+            "[REAL] wrap_slice: unsupported data_type=%s(%lld) "
+            "(supported: f16, f32, i32, i64)\n",
+            hipdnn_ep_datatype_name(data_type), (long long)data_type);
+    return -1;
+  }
+
+  // Build per-input-axis (start, step) arrays. Axes not listed in `axes`
+  // default to full-range, unit-stride: start=0, step=1.
+  int64_t start_per_axis[kSliceRuntimeMaxRank] = {};
+  int64_t step_per_axis[kSliceRuntimeMaxRank];
+  for (int d = 0; d < data_rank; ++d) {
+    step_per_axis[d] = 1;
+  }
+
+  // Validation: axes must not repeat and must be in range.
+  bool axis_set[kSliceRuntimeMaxRank] = {};
+  for (int64_t k = 0; k < K; ++k) {
+    int64_t axis = !axes_host ? k : axes_host[k];
+    if (axis < 0)
+      axis += data_rank;
+    if (axis < 0 || axis >= data_rank) {
+      fprintf(stderr, "[REAL] wrap_slice: axis=%lld out of range [0, %lld)\n",
+              (long long)axis, (long long)data_rank);
+      return -1;
+    }
+    if (axis_set[axis]) {
+      fprintf(stderr, "[REAL] wrap_slice: duplicate axis %lld\n",
+              (long long)axis);
+      return -1;
+    }
+    axis_set[axis] = true;
+
+    int64_t dim = data_shape[axis];
+    int64_t start = starts_host[k];
+    int64_t end = ends_host[k];
+    int64_t step = !steps_host ? 1 : steps_host[k];
+
+    if (step == 0) {
+      fprintf(stderr, "[REAL] wrap_slice: zero step on axis %lld\n",
+              (long long)axis);
+      return -1;
+    }
+
+    // Per ONNX-13+ Slice negative-index + clamping rules.
+    if (start < 0)
+      start += dim;
+    if (end < 0)
+      end += dim;
+    if (step > 0) {
+      start = std::clamp<int64_t>(start, 0, dim);
+      end = std::clamp<int64_t>(end, 0, dim);
+    } else {
+      start = std::clamp<int64_t>(start, 0, dim - 1);
+      end = std::clamp<int64_t>(end, -1, dim - 1);
+    }
+
+    start_per_axis[axis] = start;
+    step_per_axis[axis] = step;
+  }
+
+  // Per-axis logical output extent (= actual ONNX-Slice output size,
+  // possibly < the physically allocated buffer dim when SliceToHip
+  // over-allocated due to runtime-only starts/ends). Initialised to
+  // output_shape; only sliced axes are recomputed in the loop below.
+  int64_t logical_extent[kSliceRuntimeMaxRank];
+  for (int d = 0; d < data_rank; ++d)
+    logical_extent[d] = output_shape[d];
+
+  for (int d = 0; d < data_rank; ++d) {
+    if (!axis_set[d])
+      continue; // unmodified axis: output extent must == data extent.
+    int64_t dim = data_shape[d];
+    int64_t start = start_per_axis[d];
+    int64_t step = step_per_axis[d];
+    // The actual `end` was already clamp-resolved; we recompute the
+    // expected output size from start/step against ends_host[k]. Walk
+    // the K array to find the matching k for this axis.
+    int64_t end = 0;
+    for (int64_t k = 0; k < K; ++k) {
+      int64_t ax = !axes_host ? k : axes_host[k];
+      if (ax < 0)
+        ax += data_rank;
+      if (ax == d) {
+        end = ends_host[k];
+        break;
+      }
+    }
+    if (end < 0)
+      end += dim;
+    if (step > 0)
+      end = std::clamp<int64_t>(end, 0, dim);
+    else
+      end = std::clamp<int64_t>(end, -1, dim - 1);
+    int64_t expected;
+    if (step > 0)
+      expected = (end - start + step - 1) / step;
+    else
+      expected = (end - start + step + 1) / step;
+    if (expected < 0)
+      expected = 0;
+    // Three cases:
+    //   (a) expected == output_shape[d]: normal, logical_extent[d] =
+    //       output_shape[d] (already initialised below).
+    //   (b) expected == 0 (empty slice). Set logical_extent[d] = 0 so the
+    //       kernel fills the entire physical extent with zeros — no
+    //       separate memset, single kernel call.
+    //   (c) expected > 0 && expected < output_shape[d]: compile-time
+    //       OVER-ALLOCATION. SliceToHip uses `tensor.dim(data, i)` as an
+    //       upper bound for dynamic output dims since the actual extent
+    //       depends on runtime starts/ends. Pass logical_extent[d] =
+    //       expected so the kernel slices the valid prefix and zeros the
+    //       over-allocated tail.
+    //   (d) expected > output_shape[d] is impossible (slice cannot widen
+    //       any axis) and remains a hard error.
+    if (expected > output_shape[d]) {
+      fprintf(stderr,
+              "[REAL] wrap_slice: derived output extent on axis %d "
+              "(%lld) > IR output_shape (%lld) -- aborting "
+              "(start=%lld end=%lld step=%lld dim=%lld data_rank=%lld "
+              "K=%lld)\n",
+              d, (long long)expected, (long long)output_shape[d],
+              (long long)start, (long long)end, (long long)step, (long long)dim,
+              (long long)data_rank, (long long)K);
+      return -1;
+    }
+    // The other direction of the same disagreement. A zero-capacity output on
+    // an axis whose input is non-empty is legal ONNX but is, in every graph
+    // seen so far, the `Slice(x, k, k, axis)` accumulator seed having been
+    // sized at its exact (zero) extent instead of the data dim. Nothing here
+    // can fail: the damage lands later, when the loop appends into the empty
+    // buffer and the strided copy gets a zero pitch. So warn once per axis
+    // rather than abort, and name the shape that has to be fixed upstream in
+    // SliceToHip. See lib/Conversion/OnnxToHip/SliceConversion.cpp.
+    if (output_shape[d] == 0 && dim > 0) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        fprintf(stderr,
+                "[REAL] wrap_slice: zero-capacity output on sliced axis %d "
+                "with a non-empty input dim (%lld) -- the compile-time extent "
+                "collapsed to 0; a consumer that appends into this buffer "
+                "(e.g. a hip.loop Concat accumulator) will fail\n",
+                d, (long long)dim);
+      }
+    }
+    logical_extent[d] = expected;
+  }
+
+  for (int d = 0; d < data_rank; ++d) {
+    if (!axis_set[d]) {
+      start_per_axis[d] = 0;
+      step_per_axis[d] = 1;
+    }
+  }
+
+  RUNTIME_DEBUG_LOG("[REAL] wrap_slice: rank=%lld, K=%lld, data_type=%s "
+                    "-> hip_slice\n",
+                    (long long)data_rank, (long long)K,
+                    hipdnn_ep_datatype_name(data_type));
+
+  return hip_slice(hipdnn_ep_state_get_stream(state), data, output, data_shape,
+                   output_shape, logical_extent, start_per_axis, step_per_axis,
+                   static_cast<int>(data_rank), hip_dtype);
+}
+
 int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
                void *axes, void *steps, void *output, const int64_t *data_shape,
                int64_t data_rank, const int64_t *output_shape,
@@ -148,15 +323,6 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
     return -1;
   }
 
-  int hip_dtype = slice_hipdnn_to_hip_dtype(data_type);
-  if (hip_dtype < 0) {
-    fprintf(stderr,
-            "[REAL] wrap_slice: unsupported data_type=%s(%lld) "
-            "(supported: f16, f32, i32, i64)\n",
-            hipdnn_ep_datatype_name(data_type), (long long)data_type);
-    return -1;
-  }
-
   hipStream_t hip_stream =
       static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
 
@@ -229,160 +395,112 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
     return -1;
   }
 
-  // Build per-input-axis (start, step) arrays. Axes not listed in `axes`
-  // default to full-range, unit-stride: start=0, step=1.
-  int64_t start_per_axis[kSliceRuntimeMaxRank] = {};
-  int64_t step_per_axis[kSliceRuntimeMaxRank];
-  for (int d = 0; d < data_rank; ++d) {
-    step_per_axis[d] = 1;
+  return slice_from_host_windows(
+      state, data, output, data_shape, data_rank, output_shape,
+      starts_host.data(), ends_host.data(),
+      axes_host.empty() ? nullptr : axes_host.data(),
+      steps_host.empty() ? nullptr : steps_host.data(), K, data_type);
+}
+
+int wrap_hipsr_slice(RuntimeState *state, void *data, void *starts, void *ends,
+                     void *axes, void *steps, void *output,
+                     const int64_t *data_shape, int64_t data_rank,
+                     const int64_t *output_shape, int64_t output_rank,
+                     int64_t starts_num_elements, int64_t axes_num_elements,
+                     int64_t steps_num_elements, int64_t data_type) {
+  OP_PROFILE(
+      "slice",
+      [&] {
+        char b[64];
+        snprintf(b, sizeof(b), "r%lld:K%lld:%s", (long long)data_rank,
+                 (long long)starts_num_elements,
+                 hipdnn_ep_datatype_name(data_type));
+        return std::string(b);
+      },
+      state);
+
+  if (!state || !starts || !ends || !output || !data_shape || !output_shape) {
+    RUNTIME_DEBUG_LOG("[REAL] wrap_hipsr_slice: null required argument\n");
+    return -1;
   }
-
-  // Validation: axes must not repeat and must be in range.
-  bool axis_set[kSliceRuntimeMaxRank] = {};
-  for (int64_t k = 0; k < K; ++k) {
-    int64_t axis = axes_host.empty() ? k : axes_host[k];
-    if (axis < 0)
-      axis += data_rank;
-    if (axis < 0 || axis >= data_rank) {
-      fprintf(stderr, "[REAL] wrap_slice: axis=%lld out of range [0, %lld)\n",
-              (long long)axis, (long long)data_rank);
-      return -1;
-    }
-    if (axis_set[axis]) {
-      fprintf(stderr, "[REAL] wrap_slice: duplicate axis %lld\n",
-              (long long)axis);
-      return -1;
-    }
-    axis_set[axis] = true;
-
-    int64_t dim = data_shape[axis];
-    int64_t start = starts_host[k];
-    int64_t end = ends_host[k];
-    int64_t step = steps_host.empty() ? 1 : steps_host[k];
-
-    if (step == 0) {
-      fprintf(stderr, "[REAL] wrap_slice: zero step on axis %lld\n",
-              (long long)axis);
-      return -1;
-    }
-
-    // Per ONNX-13+ Slice negative-index + clamping rules.
-    if (start < 0)
-      start += dim;
-    if (end < 0)
-      end += dim;
-    if (step > 0) {
-      start = std::clamp<int64_t>(start, 0, dim);
-      end = std::clamp<int64_t>(end, 0, dim);
-    } else {
-      start = std::clamp<int64_t>(start, 0, dim - 1);
-      end = std::clamp<int64_t>(end, -1, dim - 1);
-    }
-
-    start_per_axis[axis] = start;
-    step_per_axis[axis] = step;
+  if (data_rank <= 0 || data_rank != output_rank) {
+    fprintf(stderr,
+            "[REAL] wrap_hipsr_slice: invalid ranks (data_rank=%lld, "
+            "output_rank=%lld)\n",
+            (long long)data_rank, (long long)output_rank);
+    return -1;
   }
-
-  // Per-axis logical output extent (= actual ONNX-Slice output size,
-  // possibly < the physically allocated buffer dim when SliceToHip
-  // over-allocated due to runtime-only starts/ends). Initialised to
-  // output_shape; only sliced axes are recomputed in the loop below.
-  int64_t logical_extent[kSliceRuntimeMaxRank];
+  int64_t data_num_elements = 1;
   for (int d = 0; d < data_rank; ++d)
-    logical_extent[d] = output_shape[d];
-
-  for (int d = 0; d < data_rank; ++d) {
-    if (!axis_set[d])
-      continue; // unmodified axis: output extent must == data extent.
-    int64_t dim = data_shape[d];
-    int64_t start = start_per_axis[d];
-    int64_t step = step_per_axis[d];
-    // The actual `end` was already clamp-resolved; we recompute the
-    // expected output size from start/step against ends_host[k]. Walk
-    // the K array to find the matching k for this axis.
-    int64_t end = 0;
-    for (int64_t k = 0; k < K; ++k) {
-      int64_t ax = axes_host.empty() ? k : axes_host[k];
-      if (ax < 0)
-        ax += data_rank;
-      if (ax == d) {
-        end = ends_host[k];
-        break;
-      }
-    }
-    if (end < 0)
-      end += dim;
-    if (step > 0)
-      end = std::clamp<int64_t>(end, 0, dim);
-    else
-      end = std::clamp<int64_t>(end, -1, dim - 1);
-    int64_t expected;
-    if (step > 0)
-      expected = (end - start + step - 1) / step;
-    else
-      expected = (end - start + step + 1) / step;
-    if (expected < 0)
-      expected = 0;
-    // Three cases:
-    //   (a) expected == output_shape[d]: normal, logical_extent[d] =
-    //       output_shape[d] (already initialised below).
-    //   (b) expected == 0 (empty slice). Set logical_extent[d] = 0 so the
-    //       kernel fills the entire physical extent with zeros — no
-    //       separate memset, single kernel call.
-    //   (c) expected > 0 && expected < output_shape[d]: compile-time
-    //       OVER-ALLOCATION. SliceToHip uses `tensor.dim(data, i)` as an
-    //       upper bound for dynamic output dims since the actual extent
-    //       depends on runtime starts/ends. Pass logical_extent[d] =
-    //       expected so the kernel slices the valid prefix and zeros the
-    //       over-allocated tail.
-    //   (d) expected > output_shape[d] is impossible (slice cannot widen
-    //       any axis) and remains a hard error.
-    if (expected > output_shape[d]) {
+    data_num_elements *= data_shape[d];
+  if (!data || data_num_elements == 0) {
+    int64_t out_num_elements = 1;
+    for (int d = 0; d < output_rank; ++d)
+      out_num_elements *= output_shape[d];
+    int64_t elem_size = hipdnn_ep_datatype_size(data_type);
+    if (elem_size <= 0) {
       fprintf(stderr,
-              "[REAL] wrap_slice: derived output extent on axis %d "
-              "(%lld) > IR output_shape (%lld) -- aborting "
-              "(start=%lld end=%lld step=%lld dim=%lld data_rank=%lld "
-              "K=%lld)\n",
-              d, (long long)expected, (long long)output_shape[d],
-              (long long)start, (long long)end, (long long)step, (long long)dim,
-              (long long)data_rank, (long long)K);
+              "[REAL] wrap_hipsr_slice: empty-input path -- unsupported "
+              "data_type=%s(%lld)\n",
+              hipdnn_ep_datatype_name(data_type), (long long)data_type);
       return -1;
     }
-    // The other direction of the same disagreement. A zero-capacity output on
-    // an axis whose input is non-empty is legal ONNX but is, in every graph
-    // seen so far, the `Slice(x, k, k, axis)` accumulator seed having been
-    // sized at its exact (zero) extent instead of the data dim. Nothing here
-    // can fail: the damage lands later, when the loop appends into the empty
-    // buffer and the strided copy gets a zero pitch. So warn once per axis
-    // rather than abort, and name the shape that has to be fixed upstream in
-    // SliceToHip. See lib/Conversion/OnnxToHip/SliceConversion.cpp.
-    if (output_shape[d] == 0 && dim > 0) {
-      static std::atomic<bool> warned{false};
-      if (!warned.exchange(true)) {
+    if (output && out_num_elements > 0) {
+      hipStream_t s =
+          static_cast<hipStream_t>(hipdnn_ep_state_get_stream(state));
+      hipError_t err = hipMemsetAsync(output, 0,
+                                      static_cast<size_t>(out_num_elements) *
+                                          static_cast<size_t>(elem_size),
+                                      s);
+      if (err != hipSuccess) {
         fprintf(stderr,
-                "[REAL] wrap_slice: zero-capacity output on sliced axis %d "
-                "with a non-empty input dim (%lld) -- the compile-time extent "
-                "collapsed to 0; a consumer that appends into this buffer "
-                "(e.g. a hip.loop Concat accumulator) will fail\n",
-                d, (long long)dim);
+                "[REAL] wrap_hipsr_slice: empty-input hipMemsetAsync "
+                "failed: %s\n",
+                hipGetErrorString(err));
+        return -1;
       }
     }
-    logical_extent[d] = expected;
+    RUNTIME_DEBUG_LOG(
+        "[REAL] wrap_hipsr_slice: empty input (data=%p "
+        "data_num_elements=%lld) -- zeroed output and returning success\n",
+        data, (long long)data_num_elements);
+    return 0;
+  }
+  if (data_rank > kSliceRuntimeMaxRank) {
+    fprintf(stderr, "[REAL] wrap_hipsr_slice: data_rank=%lld exceeds max %d\n",
+            (long long)data_rank, kSliceRuntimeMaxRank);
+    return -1;
+  }
+  if (starts_num_elements <= 0) {
+    fprintf(stderr,
+            "[REAL] wrap_hipsr_slice: starts_num_elements=%lld must be > 0\n",
+            (long long)starts_num_elements);
+    return -1;
   }
 
-  for (int d = 0; d < data_rank; ++d) {
-    if (!axis_set[d]) {
-      start_per_axis[d] = 0;
-      step_per_axis[d] = 1;
-    }
+  const int64_t K = starts_num_elements;
+  if (axes && axes_num_elements > 0 && axes_num_elements != K) {
+    fprintf(stderr,
+            "[REAL] wrap_hipsr_slice: axes_num_elements(%lld) != "
+            "starts_num_elements(%lld)\n",
+            (long long)axes_num_elements, (long long)K);
+    return -1;
+  }
+  if (steps && steps_num_elements > 0 && steps_num_elements != K) {
+    fprintf(stderr,
+            "[REAL] wrap_hipsr_slice: steps_num_elements(%lld) != "
+            "starts_num_elements(%lld)\n",
+            (long long)steps_num_elements, (long long)K);
+    return -1;
   }
 
-  RUNTIME_DEBUG_LOG("[REAL] wrap_slice: rank=%lld, K=%lld, data_type=%s "
-                    "-> hip_slice\n",
-                    (long long)data_rank, (long long)K,
-                    hipdnn_ep_datatype_name(data_type));
-
-  return hip_slice(hipdnn_ep_state_get_stream(state), data, output, data_shape,
-                   output_shape, logical_extent, start_per_axis, step_per_axis,
-                   static_cast<int>(data_rank), hip_dtype);
+  // Windows already live on the host. Read them in place; no D2H or sync.
+  return slice_from_host_windows(
+      state, data, output, data_shape, data_rank, output_shape,
+      static_cast<const int64_t *>(starts), static_cast<const int64_t *>(ends),
+      (axes && axes_num_elements > 0) ? static_cast<const int64_t *>(axes)
+                                      : nullptr,
+      (steps && steps_num_elements > 0) ? static_cast<const int64_t *>(steps)
+                                        : nullptr,
+      K, data_type);
 }

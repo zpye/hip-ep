@@ -101,6 +101,57 @@ foreach(test_name ${hipsr_e2e_models})
     )
 endforeach()
 
+# embedding.mlir lives under Dialect/Hipsr/Pipelines, not lit/e2e. The graph
+# maps a 2GB embedding table; only the file length is used.
+if(NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter)
+endif()
+if(Python3_EXECUTABLE)
+    set(test_name embedding)
+    set(test_file
+        "${CMAKE_CURRENT_SOURCE_DIR}/../lit/Dialect/Hipsr/Pipelines/${test_name}.mlir")
+    set(test_dir "${CMAKE_CURRENT_BINARY_DIR}/hipsr_${test_name}")
+    file(MAKE_DIRECTORY "${test_dir}")
+    set(dll_output "${test_dir}/${test_name}.dll")
+    set(_embedding_onnx_data "${test_dir}/embedding.onnx.data")
+    set(_embedding_onnx_data_size 2034237440)
+
+    add_test(NAME E2E_Setup_hipsr_${test_name}
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/../lit/Inputs/make_external_data.py"
+            "${_embedding_onnx_data}"
+            ${_embedding_onnx_data_size}
+        WORKING_DIRECTORY "${test_dir}"
+    )
+
+    add_test(NAME E2E_Compile_hipsr_${test_name}
+        COMMAND ${CMAKE_COMMAND} -E env
+            HIPDNN_EP_HIPSR=1
+            HIPDNN_EP_STRICT=1
+            $<TARGET_FILE:hip-compiler>
+                "${test_file}"
+                -o "${dll_output}"
+                --mode NATIVE
+        WORKING_DIRECTORY "${test_dir}"
+    )
+    set_tests_properties(E2E_Compile_hipsr_${test_name} PROPERTIES
+        DEPENDS E2E_Setup_hipsr_${test_name}
+    )
+
+    add_test(NAME E2E_Execute_hipsr_${test_name}
+        COMMAND $<TARGET_FILE:hip-test>
+            "${dll_output}"
+            --verbose
+            --validate
+        WORKING_DIRECTORY "${test_dir}"
+    )
+    set_tests_properties(E2E_Execute_hipsr_${test_name} PROPERTIES
+        DEPENDS E2E_Compile_hipsr_${test_name}
+    )
+else()
+    message(STATUS "Skipping E2E hipsr embedding: Python3 not found")
+endif()
+
 # Linux-only build-stage regression check for two ELF-init bugs that
 # actually shipped during the Linux port:
 #   1. DT_INIT_ARRAY missing  -> static ctors silently never run -> SIGFPE

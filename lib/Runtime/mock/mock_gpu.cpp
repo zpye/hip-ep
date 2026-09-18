@@ -2212,6 +2212,17 @@ int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
   return 0;
 }
 
+int wrap_hipsr_slice(RuntimeState *state, void *data, void *starts, void *ends,
+                     void *axes, void *steps, void *output,
+                     const int64_t *data_shape, int64_t data_rank,
+                     const int64_t *output_shape, int64_t output_rank,
+                     int64_t starts_num_elements, int64_t axes_num_elements,
+                     int64_t steps_num_elements, int64_t data_type) {
+  return wrap_slice(state, data, starts, ends, axes, steps, output, data_shape,
+                    data_rank, output_shape, output_rank, starts_num_elements,
+                    axes_num_elements, steps_num_elements, data_type);
+}
+
 int wrap_scatter_nd(RuntimeState *state, void *data, void *indices,
                     void *updates, void *output, const int32_t *count_ptr,
                     const int64_t *data_shape, int64_t data_rank,

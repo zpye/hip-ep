@@ -10,6 +10,7 @@ add_library(HipsrDialectTransforms STATIC
   ExternalizeConstants.cpp
   HipsrPoolAllocPass.cpp
   HipsrInlineRegionsPass.cpp
+  InsertDomainStreamSyncs.cpp
   MainGraphAbiPass.cpp
   MaterializeInitTensorsPass.cpp
   PartitionPoolDomains.cpp
