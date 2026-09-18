@@ -368,6 +368,7 @@ if(NOT BUILD_MOCK_RUNTIME)
     compile_to_bitcode(real/sign.cpp runtime_sign.bc)
     compile_to_bitcode(real/mod.cpp runtime_mod.bc)
     compile_to_bitcode(real/slice.cpp runtime_slice.bc)
+    compile_to_bitcode(real/hipsr_slice.cpp runtime_hipsr_slice.bc)
     compile_to_bitcode(real/scatter_nd.cpp runtime_scatter_nd.bc)
     compile_to_bitcode(real/multi_head_attention.cpp runtime_multi_head_attention.bc)
     compile_to_bitcode(real/nonzero.cpp runtime_nonzero.bc)
@@ -460,6 +461,7 @@ if(NOT BUILD_MOCK_RUNTIME)
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_sign.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_mod.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_slice.bc
+        ${CMAKE_CURRENT_BINARY_DIR}/runtime_hipsr_slice.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_scatter_nd.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_multi_head_attention.bc
         ${CMAKE_CURRENT_BINARY_DIR}/runtime_nonzero.bc
