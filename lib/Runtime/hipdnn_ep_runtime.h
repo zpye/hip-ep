@@ -1870,21 +1870,23 @@ int wrap_mod(RuntimeState *state, void *lhs, void *rhs, void *output,
 
 // Slice operation wrapper (ONNX Slice native fallback).
 //
-// Today this is a stub: the OnnxToHip decompose pattern handles the common
-// case (compile-time constant starts/ends/axes/steps with positive unit
-// stride) by rewriting onnx.Slice to tensor.extract_slice, so this runtime
-// entry is only called for non-constant-indices or negative-step Slices.
-// The stub only logs its parameters and returns success — models that
-// exercise it will produce incorrect Slice output but will still link and
-// run end-to-end for IR-shape debugging.
-//
 // axes / steps may be nullptr when the corresponding optional input is absent.
+// wrap_slice expects starts / ends / axes / steps to be device pointers.
 int wrap_slice(RuntimeState *state, void *data, void *starts, void *ends,
                void *axes, void *steps, void *output, const int64_t *data_shape,
                int64_t data_rank, const int64_t *output_shape,
                int64_t output_rank, int64_t starts_num_elements,
                int64_t axes_num_elements, int64_t steps_num_elements,
                int64_t data_type);
+
+// Hipsr Slice passes starts / ends / axes / steps as host pointers.
+// wrap_hipsr_slice reads them in place; it does not copy or sync.
+int wrap_hipsr_slice(RuntimeState *state, void *data, void *starts, void *ends,
+                     void *axes, void *steps, void *output,
+                     const int64_t *data_shape, int64_t data_rank,
+                     const int64_t *output_shape, int64_t output_rank,
+                     int64_t starts_num_elements, int64_t axes_num_elements,
+                     int64_t steps_num_elements, int64_t data_type);
 
 // ScatterND: output = copy(data), then output[indices[i]] (reduction)
 // updates[i].
